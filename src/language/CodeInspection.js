@@ -19,6 +19,8 @@
  *
  */
 
+/*global jsPromise*/
+
 /**
  * Manages linters and other code inspections on a per-language basis. Provides a UI and status indicator for
  * the resulting errors/warnings.
@@ -26,21 +28,22 @@
  * Currently, inspection providers are only invoked on the current file and only when it is opened, switched to,
  * or saved. But in the future, inspectors may be invoked as part of a global scan, at intervals while typing, etc.
  * Currently, results are only displayed in a bottom panel list and in a status bar icon. But in the future,
- * results may also be displayed inline in the editor (as gutter markers, squiggly underlines, etc.).
+ * results may also be displayed inline in the editor (as gutter markers, etc.).
  * In the future, support may also be added for error/warning providers that cannot process a single file at a time
  * (e.g. a full-project compiler).
  */
 define(function (require, exports, module) {
 
 
-    var _ = require("thirdparty/lodash");
+    const _ = require("thirdparty/lodash");
 
     // Load dependent modules
-    var Commands                = require("command/Commands"),
+    const Commands                = require("command/Commands"),
         WorkspaceManager        = require("view/WorkspaceManager"),
         CommandManager          = require("command/CommandManager"),
         DocumentManager         = require("document/DocumentManager"),
         EditorManager           = require("editor/EditorManager"),
+        Editor                  = require("editor/Editor").Editor,
         MainViewManager         = require("view/MainViewManager"),
         LanguageManager         = require("language/LanguageManager"),
         PreferencesManager      = require("preferences/PreferencesManager"),
@@ -54,28 +57,43 @@ define(function (require, exports, module) {
         ResultsTemplate         = require("text!htmlContent/problems-panel-table.html"),
         Mustache                = require("thirdparty/mustache/mustache");
 
-    var INDICATOR_ID = "status-inspection";
+    const INDICATOR_ID = "status-inspection";
 
     /** Values for problem's 'type' property */
-    var Type = {
+    const Type = {
         /** Unambiguous error, such as a syntax error */
-        ERROR: "problem_type_error",
+        ERROR: "error",
         /** Maintainability issue, probable error / bad smell, etc. */
-        WARNING: "problem_type_warning",
-        /** Inspector unable to continue, code too complex for static analysis, etc. Not counted in error/warning tally. */
-        META: "problem_type_meta"
+        WARNING: "warning",
+        /** Inspector unable to continue, code too complex for static analysis, etc. Not counted in err/warn tally. */
+        META: "meta"
     };
+
+    function _getIconClassForType(type) {
+        switch (type) {
+        case Type.ERROR: return "line-icon-problem_type_error fa-solid fa-times-circle";
+        case Type.WARNING: return "line-icon-problem_type_warning fa-solid fa-exclamation-triangle";
+        case Type.META: return "line-icon-problem_type_meta fa-solid fa-info";
+        default: return "line-icon-problem_type_meta fa-solid fa-info";
+        }
+    }
+
+    const CSS_TEXT_UNDERLINE_CLASS_ERROR = "editor-text-fragment-error",
+        CSS_TEXT_UNDERLINE_CLASS_WARN = "editor-text-fragment-warn",
+        CSS_TEXT_UNDERLINE_CLASS_INFO = "editor-text-fragment-info";
+
+    const CODE_MARK_TYPE_INSPECTOR = "codeInspector";
 
     /**
      * Constants for the preferences defined in this file.
      */
-    var PREF_ENABLED            = "enabled",
+    const PREF_ENABLED            = "enabled",
         PREF_COLLAPSED          = "collapsed",
         PREF_ASYNC_TIMEOUT      = "asyncTimeout",
         PREF_PREFER_PROVIDERS   = "prefer",
         PREF_PREFERRED_ONLY     = "usePreferredOnly";
 
-    var prefs = PreferencesManager.getExtensionPrefs("linting");
+    const prefs = PreferencesManager.getExtensionPrefs("linting");
 
     /**
      * When disabled, the errors panel is closed and the status bar icon is grayed out.
@@ -254,19 +272,19 @@ define(function (require, exports, module) {
                             };
                             runPromise.resolve({errors: [errTimeout]});
                         }, prefs.get(PREF_ASYNC_TIMEOUT));
-                        provider.scanFileAsync(fileText, file.fullPath)
-                            .done(function (scanResult) {
+                        jsPromise(provider.scanFileAsync(fileText, file.fullPath))
+                            .then(function (scanResult) {
                                 PerfUtils.addMeasurement(perfTimerProvider);
                                 runPromise.resolve(scanResult);
                             })
-                            .fail(function (err) {
+                            .catch(function (err) {
                                 PerfUtils.finalizeMeasurement(perfTimerProvider);
                                 var errError = {
                                     pos: {line: -1, col: 0},
                                     message: StringUtils.format(Strings.LINTER_FAILED, provider.name, err),
                                     type: Type.ERROR
                                 };
-                                console.error("[CodeInspection] Provider " + provider.name + " (async) failed: " + err);
+                                console.error("[CodeInspection] Provider " + provider.name + " (async) failed: " + err.stack);
                                 runPromise.resolve({errors: [errError]});
                             });
                     } else {
@@ -281,7 +299,7 @@ define(function (require, exports, module) {
                                 message: StringUtils.format(Strings.LINTER_FAILED, provider.name, err),
                                 type: Type.ERROR
                             };
-                            console.error("[CodeInspection] Provider " + provider.name + " (sync) threw an error: " + err);
+                            console.error("[CodeInspection] Provider " + provider.name + " (sync) threw an error: " + err.stack);
                             runPromise.resolve({errors: [errError]});
                         }
                     }
@@ -349,6 +367,103 @@ define(function (require, exports, module) {
         StatusBar.updateIndicator(INDICATOR_ID, true, "inspection-errors", tooltip);
     }
 
+    function _getCSSClass(error){
+        switch (error.type) {
+        case Type.ERROR: return CSS_TEXT_UNDERLINE_CLASS_ERROR;
+        case Type.WARNING: return CSS_TEXT_UNDERLINE_CLASS_WARN;
+        case Type.META: return CSS_TEXT_UNDERLINE_CLASS_INFO;
+        }
+    }
+
+    function _getCSSClassPriority(cssClass){
+        switch (cssClass) {
+        case CSS_TEXT_UNDERLINE_CLASS_ERROR: return 3;
+        case CSS_TEXT_UNDERLINE_CLASS_WARN: return 2;
+        case CSS_TEXT_UNDERLINE_CLASS_INFO: return 1;
+        }
+    }
+
+    function _shouldMarkTokenAtPosition(editor, error) {
+        if(isNaN(error.pos.line) || isNaN(error.pos.ch) || error.pos.line < 0 || error.pos.ch < 0){
+            console.warn("CodeInspector: Invalid error position: ", error);
+            return false;
+        }
+        // now we only apply a style if there is not already a higher priority style applied to it.
+        // Ie. If an error style is applied, we don't apply an info style over it as error takes precedence.
+        let markings = editor.findMarksAt(error.pos, CODE_MARK_TYPE_INSPECTOR);
+        let classToApply = _getCSSClass(error);
+        let classToApplyPriority = _getCSSClassPriority(classToApply);
+        let shouldMark = true;
+        for(let mark of markings){
+            let classPriority = _getCSSClassPriority(mark.className);
+            if(classPriority<classToApplyPriority){
+                mark.clear();
+            } else {
+                // there's something with a higher priority marking the token
+                shouldMark = false;
+            }
+        }
+        return shouldMark;
+    }
+
+    function _updateGutterMarks(editor, gutterErrorMessages) {
+        editor.clearGutter(Editor.DEBUG_INFO_GUTTER);
+        // add gutter icons
+        for(let lineno of Object.keys(gutterErrorMessages)){
+            let gutterMessage = gutterErrorMessages[lineno].reduce((prev, current)=>{
+                return {message: `${prev.message}\n${current.message}`};
+            }, {message: ''});
+            let type = gutterErrorMessages[lineno][0].type,
+                line = gutterErrorMessages[lineno][0].line,
+                ch = gutterErrorMessages[lineno][0].ch;
+            let $marker = $('<div><span>')
+                .attr('title', gutterMessage.message)
+                .addClass(Editor.DEBUG_INFO_GUTTER);
+            $marker.click(function (){
+               editor.setCursorPos(line, ch);
+            });
+            $marker.find('span')
+                .addClass(_getIconClassForType(type))
+                .addClass("brackets-inspection-gutter-marker")
+                .html('&nbsp;');
+            editor.setGutterMarker(line, Editor.DEBUG_INFO_GUTTER, $marker[0]);
+        }
+    }
+
+    /**
+     * Adds gutter icons and squiggly lines under err/warn/info to editor after lint.
+     * @param resultProviderEntries
+     * @private
+     */
+    function _updateEditorMarks(resultProviderEntries) {
+        let editor = EditorManager.getCurrentFullEditor();
+        editor.operation(function () {
+            editor.clearAllMarks(CODE_MARK_TYPE_INSPECTOR);
+            let gutterErrorMessages = {};
+            if(editor && resultProviderEntries && resultProviderEntries.length){
+                for(let resultProvider of resultProviderEntries){
+                    let errors = (resultProvider.result && resultProvider.result.errors) || [];
+                    for(let error of errors){
+                        // todo: add error.message on hover
+                        if(!_shouldMarkTokenAtPosition(editor, error)){
+                            continue;
+                        }
+                        // add squiggly lines
+                        editor.markToken(CODE_MARK_TYPE_INSPECTOR, error.pos, {
+                            className: _getCSSClass(error)
+                        });
+                        let line = error.pos.line || 0;
+                        let ch = error.pos.ch || 0;
+                        let gutterMessage = gutterErrorMessages[line] || [];
+                        gutterMessage.push({message: error.message, type: error.type, line, ch});
+                        gutterErrorMessages[line] = gutterMessage;
+                    }
+                }
+                _updateGutterMarks(editor, gutterErrorMessages);
+            }
+        });
+    }
+
     /**
      * Run inspector applicable to current document. Updates status bar indicator and refreshes error list in
      * bottom panel. Does not run if inspection is disabled or if a providerName is given and does not
@@ -375,9 +490,11 @@ define(function (require, exports, module) {
             var allErrors = [];
             var html;
             var providersReportingProblems = [];
+            $problemsPanelTable.empty();
 
             // run all the providers registered for this file type
             (_currentPromise = inspectFile(currentDoc.file, providerList)).then(function (results) {
+                _updateEditorMarks(results);
                 // check if promise has not changed while inspectFile was running
                 if (this !== _currentPromise) {
                     return;
@@ -422,6 +539,8 @@ define(function (require, exports, module) {
                             if (error.type !== Type.META) {
                                 numProblems++;
                             }
+
+                            error.iconClass = _getIconClassForType(error.type);
 
                             // Hide the errors when the provider is collapsed.
                             error.display = isExpanded ? "" : "forced-hidden";
